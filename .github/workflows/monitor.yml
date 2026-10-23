@@ -1,5 +1,5 @@
 
-name: Monitor Gamelife TCG
+name: Monitor CarteMagic TCG
 
 on:
   schedule:
@@ -12,18 +12,20 @@ permissions:
 jobs:
   monitor:
     runs-on: ubuntu-latest
+
     steps:
       - name: Scarica il progetto
         uses: actions/checkout@v4
-        with:
-          persist-credentials: true
 
       - name: Configura Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Controlla Gamelife
+      - name: Installa librerie
+        run: python -m pip install requests beautifulsoup4
+
+      - name: Controlla CarteMagic
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
