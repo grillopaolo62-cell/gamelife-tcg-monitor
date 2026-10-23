@@ -1,7 +1,6 @@
 
 import os
 import json
-import re
 import time
 import requests
 from bs4 import BeautifulSoup
@@ -21,7 +20,7 @@ KEYWORDS = [
     "pokemon", "one piece", "magic", "yu-gi-oh", "yugioh",
     "lorcana", "dragon ball", "digimon", "riftbound",
     "union arena", "star wars unlimited", "final fantasy",
-    "fab", "flesh and blood", "battle spirits"
+    "flesh and blood", "battle spirits"
 ]
 
 HEADERS = {
@@ -31,12 +30,10 @@ HEADERS = {
 
 def send_telegram(message):
     if not BOT_TOKEN or not CHAT_ID:
-        print("Errore: mancano i segreti Telegram.")
-        return
+        raise RuntimeError("Mancano i segreti Telegram su GitHub.")
 
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     response = requests.post(
-        url,
+        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
         data={
             "chat_id": CHAT_ID,
             "text": message,
@@ -49,18 +46,18 @@ def send_telegram(message):
 
 def load_state():
     if not os.path.exists(STATE_FILE):
-        return {"products": []}
+        return set()
 
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as file:
             data = json.load(file)
 
         if isinstance(data, list):
-            return {"products": data}
+            return set(data)
 
-        return data
+        return set(data.get("products", []))
     except (json.JSONDecodeError, OSError):
-        return {"products": []}
+        return set()
 
 
 def save_state(products):
@@ -74,26 +71,17 @@ def save_state(products):
 
 
 def is_tcg(title):
-    title_lower = title.lower()
-    return any(keyword in title_lower for keyword in KEYWORDS)
+    return any(word in title.lower() for word in KEYWORDS)
 
 
-def get_products(url):
+def get_products(url, category):
     products = {}
 
     for page in range(1, 41):
         page_url = url if page == 1 else f"{url}?product-page={page}"
 
-        try:
-            response = requests.get(
-                page_url,
-                headers=HEADERS,
-                timeout=25,
-            )
-            response.raise_for_status()
-        except requests.RequestException as error:
-            print(f"Errore nel caricamento {page_url}: {error}")
-            break
+        response = requests.get(page_url, headers=HEADERS, timeout=25)
+        response.raise_for_status()
 
         soup = BeautifulSoup(response.text, "html.parser")
         cards = soup.select(
@@ -102,32 +90,21 @@ def get_products(url):
         )
 
         if not cards:
-            if page == 1:
-                print(f"Nessun prodotto riconosciuto in {url}")
             break
 
-        found_on_page = 0
-
         for card in cards:
-            link = card.select_one(
-                "a.woocommerce-LoopProduct-link, "
-                "a.product-image-link, a[href]"
-            )
             title_element = card.select_one(
-                ".woocommerce-loop-product__title, "
-                ".product-title, h2, h3"
+                ".woocommerce-loop-product__title, .product-title, h2, h3"
             )
+            link = card.select_one("a[href]")
 
-            if not link or not title_element:
+            if not title_element or not link:
                 continue
 
             title = title_element.get_text(" ", strip=True)
             product_url = urljoin(BASE_URL, link.get("href", ""))
 
-            if not title or not product_url.startswith("http"):
-                continue
-
-            if not is_tcg(title):
+            if not title or not is_tcg(title):
                 continue
 
             price_element = card.select_one(
@@ -135,21 +112,15 @@ def get_products(url):
             )
             price = (
                 price_element.get_text(" ", strip=True)
-                if price_element
-                else "Prezzo da verificare"
+                if price_element else "Prezzo da verificare"
             )
 
             products[product_url] = {
                 "title": title,
                 "url": product_url,
                 "price": price,
+                "category": category,
             }
-            found_on_page += 1
-
-        print(f"Pagina {page}: {found_on_page} prodotti TCG")
-
-        if page > 1 and found_on_page == 0:
-            break
 
         time.sleep(1)
 
@@ -157,49 +128,73 @@ def get_products(url):
 
 
 def main():
-    old_state = load_state()
-    old_products = set(old_state.get("products", []))
+    old_products = load_state()
     current_products = {}
 
     for category, url in SOURCES:
-        print(f"Controllo: {category}")
-        found = get_products(url)
-
-        for product_url, product in found.items():
-            product["category"] = category
-            current_products[product_url] = product
+        print(f"Controllo {category}...")
+        try:
+            current_products.update(get_products(url, category))
+        except requests.RequestException as error:
+            print(f"Errore durante il controllo: {error}")
+            raise
 
     if not current_products:
-        print("Nessun prodotto trovato. Non modifico lo stato.")
-        return
-
-    new_urls = set(current_products) - old_products
-
-    if not old_products:
-        save_state(current_products.keys())
-        send_telegram(
-            "Monitor CarteMagic avviato!\n"
-            f"Prodotti TCG riconosciuti: {len(current_products)}.\n"
-            "Questa è la scansione iniziale: ti avviserò "
-            "quando rileverò nuovi prodotti."
+        raise RuntimeError(
+            "Nessun prodotto trovato: storico non modificato."
         )
-        print("Prima scansione completata.")
+
+    current_urls = set(current_products)
+
+    # Prima scansione: registra i prodotti senza inviare notifiche singole.
+    if not old_products:
+        save_state(current_urls)
+        send_telegram(
+            "✅ Monitor CarteMagic attivo!\n"
+            f"Registrati {len(current_urls)} prodotti TCG.\n"
+            "Da ora ti avviserò solo delle novità, "
+            "con un unico messaggio riepilogativo."
+        )
         return
+
+    new_urls = current_urls - old_products
+
+    # Salva i prodotti prima dell'invio per evitare duplicati ai controlli successivi.
+    save_state(old_products | current_urls)
+
+    if not new_urls:
+        print("Nessuna novità.")
+        return
+
+    messages = ["🆕 NOVITÀ TCG SU CARTEMAGIC\n"]
 
     for product_url in sorted(new_urls):
         product = current_products[product_url]
-        message = (
-            f"🆕 NUOVO PRODOTTO TCG\n\n"
+        messages.append(
             f"📦 {product['title']}\n"
             f"🏷️ {product['category']}\n"
-            f"💶 {product['price']}\n\n"
+            f"💶 {product['price']}\n"
             f"🔗 {product['url']}"
         )
-        send_telegram(message)
+
+    message = "\n\n".join(messages)
+
+    # Telegram limita i messaggi a circa 4096 caratteri.
+    chunks = []
+    while len(message) > 3900:
+        split_at = message.rfind("\n\n", 0, 3900)
+        if split_at < 1:
+            split_at = 3900
+        chunks.append(message[:split_at])
+        message = message[split_at:].lstrip()
+    if message:
+        chunks.append(message)
+
+    for chunk in chunks:
+        send_telegram(chunk)
         time.sleep(1)
 
-    save_state(old_products | set(current_products.keys()))
-    print(f"Controllo completato. Nuovi prodotti: {len(new_urls)}.")
+    print(f"Novità rilevate: {len(new_urls)}")
 
 
 if __name__ == "__main__":
