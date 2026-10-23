@@ -13,6 +13,8 @@ SOURCES = [
 ]
 
 STATE_FILE = "seen_products.json"
+BASELINE_FILE = ".baseline_initialized"
+
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
@@ -20,11 +22,15 @@ KEYWORDS = [
     "pokemon", "one piece", "magic", "yu-gi-oh", "yugioh",
     "lorcana", "dragon ball", "digimon", "riftbound",
     "union arena", "star wars unlimited", "final fantasy",
-    "flesh and blood", "battle spirits"
+    "flesh and blood", "battle spirits", "gundam",
+    "palworld", "battle spirits saga"
 ]
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130.0 Safari/537.36"
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 Chrome/130.0 Safari/537.36"
+    )
 }
 
 
@@ -51,9 +57,14 @@ def load_state():
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as file:
             data = json.load(file)
+
         if isinstance(data, list):
             return set(data)
-        return set(data.get("products", []))
+
+        if isinstance(data, dict) and isinstance(data.get("products"), list):
+            return set(data["products"])
+
+        return None
     except (json.JSONDecodeError, OSError):
         return None
 
@@ -61,7 +72,7 @@ def load_state():
 def save_state(products):
     with open(STATE_FILE, "w", encoding="utf-8") as file:
         json.dump(
-            {"products": sorted(products)},
+            {"site": "cartemagic.com", "products": sorted(products)},
             file,
             ensure_ascii=False,
             indent=2,
@@ -78,7 +89,9 @@ def scan(url, category):
     for page in range(1, 41):
         page_url = url if page == 1 else f"{url}?product-page={page}"
 
-        response = requests.get(page_url, headers=HEADERS, timeout=25)
+        response = requests.get(
+            page_url, headers=HEADERS, timeout=25
+        )
         response.raise_for_status()
         soup = BeautifulSoup(response.text, "html.parser")
 
@@ -86,6 +99,7 @@ def scan(url, category):
             "li.product, .product-small, .product-item, "
             ".wc-block-grid__product"
         )
+
         if not cards:
             break
 
@@ -94,6 +108,7 @@ def scan(url, category):
                 ".woocommerce-loop-product__title, .product-title, h2, h3"
             )
             link = card.select_one("a[href]")
+
             if not title_el or not link:
                 continue
 
@@ -124,7 +139,6 @@ def scan(url, category):
 
 
 def main():
-    previous = load_state()
     current = {}
 
     for category, url in SOURCES:
@@ -133,22 +147,35 @@ def main():
 
     if not current:
         raise RuntimeError(
-            "Nessun prodotto trovato: controllo interrotto senza modificare lo storico."
+            "Nessun prodotto trovato. Storico non modificato."
         )
 
     current_urls = set(current)
+    previous = load_state()
 
-    # Se manca lo storico, inizializza senza notificare i prodotti esistenti.
-    if previous is None:
+    # Prima esecuzione dopo questa modifica:
+    # aggiorna lo storico senza notificare i prodotti già esistenti.
+    if not os.path.exists(BASELINE_FILE):
         save_state(current_urls)
-        telegram(
-            "✅ Monitor CarteMagic configurato.\n"
-            f"Registrati {len(current_urls)} prodotti TCG.\n"
-            "Da ora riceverai avvisi solo per le novità rilevate."
+
+        with open(BASELINE_FILE, "w", encoding="utf-8") as file:
+            file.write("baseline completato\n")
+
+        print(
+            f"Storico inizializzato: {len(current_urls)} prodotti. "
+            "Nessuna notifica di prodotti inviata."
         )
         return
 
+    if previous is None:
+        raise RuntimeError(
+            "Storico mancante o illeggibile. "
+            "Interrotto per evitare notifiche di massa."
+        )
+
     new_urls = current_urls - previous
+
+    # Aggiorna lo storico solo dopo una scansione riuscita.
     save_state(previous | current_urls)
 
     if not new_urls:
@@ -165,7 +192,6 @@ def main():
             f"🔗 {p['url']}"
         )
 
-    # Un solo messaggio, diviso solo se supera il limite di Telegram.
     message = "🆕 NOVITÀ TCG SU CARTEMAGIC\n\n" + "\n\n".join(entries)
     chunks = []
 
