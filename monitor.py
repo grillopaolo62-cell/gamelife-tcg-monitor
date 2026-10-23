@@ -8,7 +8,7 @@ from urllib.parse import urljoin
 
 BASE_URL = "https://www.cartemagic.com"
 SOURCES = [
-    ("Novità TCG", "https://www.cartemagic.com/carte-collezionabili/"),
+    ("Catalogo TCG", "https://www.cartemagic.com/carte-collezionabili/"),
     ("Preordini TCG", "https://www.cartemagic.com/categoria/preordini/"),
 ]
 
@@ -28,9 +28,9 @@ HEADERS = {
 }
 
 
-def send_telegram(message):
+def telegram(message):
     if not BOT_TOKEN or not CHAT_ID:
-        raise RuntimeError("Mancano i segreti Telegram su GitHub.")
+        raise RuntimeError("Configurazione Telegram mancante.")
 
     response = requests.post(
         f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
@@ -46,18 +46,16 @@ def send_telegram(message):
 
 def load_state():
     if not os.path.exists(STATE_FILE):
-        return set()
+        return None
 
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as file:
             data = json.load(file)
-
         if isinstance(data, list):
             return set(data)
-
         return set(data.get("products", []))
     except (json.JSONDecodeError, OSError):
-        return set()
+        return None
 
 
 def save_state(products):
@@ -74,48 +72,46 @@ def is_tcg(title):
     return any(word in title.lower() for word in KEYWORDS)
 
 
-def get_products(url, category):
-    products = {}
+def scan(url, category):
+    found = {}
 
     for page in range(1, 41):
         page_url = url if page == 1 else f"{url}?product-page={page}"
 
         response = requests.get(page_url, headers=HEADERS, timeout=25)
         response.raise_for_status()
-
         soup = BeautifulSoup(response.text, "html.parser")
+
         cards = soup.select(
             "li.product, .product-small, .product-item, "
             ".wc-block-grid__product"
         )
-
         if not cards:
             break
 
         for card in cards:
-            title_element = card.select_one(
+            title_el = card.select_one(
                 ".woocommerce-loop-product__title, .product-title, h2, h3"
             )
             link = card.select_one("a[href]")
-
-            if not title_element or not link:
+            if not title_el or not link:
                 continue
 
-            title = title_element.get_text(" ", strip=True)
+            title = title_el.get_text(" ", strip=True)
             product_url = urljoin(BASE_URL, link.get("href", ""))
 
             if not title or not is_tcg(title):
                 continue
 
-            price_element = card.select_one(
+            price_el = card.select_one(
                 ".price, .woocommerce-Price-amount"
             )
             price = (
-                price_element.get_text(" ", strip=True)
-                if price_element else "Prezzo da verificare"
+                price_el.get_text(" ", strip=True)
+                if price_el else "Prezzo da verificare"
             )
 
-            products[product_url] = {
+            found[product_url] = {
                 "title": title,
                 "url": product_url,
                 "price": price,
@@ -124,77 +120,70 @@ def get_products(url, category):
 
         time.sleep(1)
 
-    return products
+    return found
 
 
 def main():
-    old_products = load_state()
-    current_products = {}
+    previous = load_state()
+    current = {}
 
     for category, url in SOURCES:
-        print(f"Controllo {category}...")
-        try:
-            current_products.update(get_products(url, category))
-        except requests.RequestException as error:
-            print(f"Errore durante il controllo: {error}")
-            raise
+        print(f"Controllo {category}")
+        current.update(scan(url, category))
 
-    if not current_products:
+    if not current:
         raise RuntimeError(
-            "Nessun prodotto trovato: storico non modificato."
+            "Nessun prodotto trovato: controllo interrotto senza modificare lo storico."
         )
 
-    current_urls = set(current_products)
+    current_urls = set(current)
 
-    # Prima scansione: registra i prodotti senza inviare notifiche singole.
-    if not old_products:
+    # Se manca lo storico, inizializza senza notificare i prodotti esistenti.
+    if previous is None:
         save_state(current_urls)
-        send_telegram(
-            "✅ Monitor CarteMagic attivo!\n"
+        telegram(
+            "✅ Monitor CarteMagic configurato.\n"
             f"Registrati {len(current_urls)} prodotti TCG.\n"
-            "Da ora ti avviserò solo delle novità, "
-            "con un unico messaggio riepilogativo."
+            "Da ora riceverai avvisi solo per le novità rilevate."
         )
         return
 
-    new_urls = current_urls - old_products
-
-    # Salva i prodotti prima dell'invio per evitare duplicati ai controlli successivi.
-    save_state(old_products | current_urls)
+    new_urls = current_urls - previous
+    save_state(previous | current_urls)
 
     if not new_urls:
         print("Nessuna novità.")
         return
 
-    messages = ["🆕 NOVITÀ TCG SU CARTEMAGIC\n"]
-
-    for product_url in sorted(new_urls):
-        product = current_products[product_url]
-        messages.append(
-            f"📦 {product['title']}\n"
-            f"🏷️ {product['category']}\n"
-            f"💶 {product['price']}\n"
-            f"🔗 {product['url']}"
+    entries = []
+    for url in sorted(new_urls):
+        p = current[url]
+        entries.append(
+            f"📦 {p['title']}\n"
+            f"🏷️ {p['category']}\n"
+            f"💶 {p['price']}\n"
+            f"🔗 {p['url']}"
         )
 
-    message = "\n\n".join(messages)
-
-    # Telegram limita i messaggi a circa 4096 caratteri.
+    # Un solo messaggio, diviso solo se supera il limite di Telegram.
+    message = "🆕 NOVITÀ TCG SU CARTEMAGIC\n\n" + "\n\n".join(entries)
     chunks = []
+
     while len(message) > 3900:
         split_at = message.rfind("\n\n", 0, 3900)
-        if split_at < 1:
+        if split_at <= 0:
             split_at = 3900
         chunks.append(message[:split_at])
         message = message[split_at:].lstrip()
+
     if message:
         chunks.append(message)
 
     for chunk in chunks:
-        send_telegram(chunk)
+        telegram(chunk)
         time.sleep(1)
 
-    print(f"Novità rilevate: {len(new_urls)}")
+    print(f"Nuovi prodotti: {len(new_urls)}")
 
 
 if __name__ == "__main__":
