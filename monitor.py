@@ -1,177 +1,205 @@
 
 import os
 import json
-import urllib.request
-import urllib.error
-from html.parser import HTMLParser
-from urllib.parse import urljoin, urlparse
+import re
+import time
+import requests
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin
 
-URL = "https://www.cartemagic.com/carte-collezionabili/"
-SITE = "cartemagic.com"
-BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+BASE_URL = "https://www.cartemagic.com"
+SOURCES = [
+    ("Novità TCG", "https://www.cartemagic.com/carte-collezionabili/"),
+    ("Preordini TCG", "https://www.cartemagic.com/categoria/preordini/"),
+]
+
 STATE_FILE = "seen_products.json"
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
+KEYWORDS = [
+    "pokemon", "one piece", "magic", "yu-gi-oh", "yugioh",
+    "lorcana", "dragon ball", "digimon", "riftbound",
+    "union arena", "star wars unlimited", "final fantasy",
+    "fab", "flesh and blood", "battle spirits"
+]
 
-class ProductParser(HTMLParser):
-    def __init__(self):
-        super().__init__(convert_charrefs=True)
-        self.products = []
-        self.anchor = None
-
-    def handle_starttag(self, tag, attrs):
-        attrs = dict(attrs)
-
-        if tag == "a":
-            href = attrs.get("href", "")
-            classes = attrs.get("class", "").lower()
-            full_url = urljoin(URL, href)
-            path = urlparse(full_url).path.lower()
-
-            if (
-                urlparse(full_url).netloc.endswith(SITE)
-                and (
-                    "/prodotto/" in path
-                    or "woocommerce-loop-product__link" in classes
-                )
-            ):
-                self.anchor = {
-                    "url": full_url.split("?")[0].rstrip("/") + "/",
-                    "text": ""
-                }
-
-        elif tag == "img" and self.anchor:
-            alt = attrs.get("alt", "").strip()
-            if alt:
-                self.anchor["text"] += " " + alt
-
-    def handle_data(self, data):
-        if self.anchor:
-            self.anchor["text"] += " " + data.strip()
-
-    def handle_endtag(self, tag):
-        if tag == "a" and self.anchor:
-            name = " ".join(self.anchor["text"].split())
-            if name:
-                self.products.append({
-                    "url": self.anchor["url"],
-                    "name": name
-                })
-            self.anchor = None
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130.0 Safari/537.36"
+}
 
 
 def send_telegram(message):
-    data = json.dumps({
-        "chat_id": CHAT_ID,
-        "text": message,
-        "disable_web_page_preview": True
-    }).encode("utf-8")
+    if not BOT_TOKEN or not CHAT_ID:
+        print("Errore: mancano i segreti Telegram.")
+        return
 
-    request = urllib.request.Request(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        data=data,
-        headers={"Content-Type": "application/json"}
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    response = requests.post(
+        url,
+        data={
+            "chat_id": CHAT_ID,
+            "text": message,
+            "disable_web_page_preview": True,
+        },
+        timeout=20,
     )
-
-    with urllib.request.urlopen(request, timeout=20) as response:
-        result = json.loads(response.read().decode("utf-8"))
-
-    if not result.get("ok"):
-        raise RuntimeError("Invio Telegram non riuscito")
-
-
-def fetch_page():
-    request = urllib.request.Request(
-        URL,
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/130.0.0.0 Safari/537.36"
-            ),
-            "Accept": (
-                "text/html,application/xhtml+xml,"
-                "application/xml;q=0.9,*/*;q=0.8"
-            ),
-            "Accept-Language": "it-IT,it;q=0.9,en;q=0.8"
-        }
-    )
-
-    try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            return response.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as error:
-        raise RuntimeError(
-            f"CarteMagic ha restituito HTTP {error.code}. "
-            "Bisogna verificare un metodo alternativo di lettura."
-        ) from error
+    response.raise_for_status()
 
 
 def load_state():
+    if not os.path.exists(STATE_FILE):
+        return {"products": []}
+
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as file:
-            return json.load(file)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return None
+            data = json.load(file)
+
+        if isinstance(data, list):
+            return {"products": data}
+
+        return data
+    except (json.JSONDecodeError, OSError):
+        return {"products": []}
 
 
 def save_state(products):
-    state = {
-        "site": SITE,
-        "products": sorted(products)
-    }
-
     with open(STATE_FILE, "w", encoding="utf-8") as file:
-        json.dump(state, file, ensure_ascii=False, indent=2)
+        json.dump(
+            {"products": sorted(products)},
+            file,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+
+def is_tcg(title):
+    title_lower = title.lower()
+    return any(keyword in title_lower for keyword in KEYWORDS)
+
+
+def get_products(url):
+    products = {}
+
+    for page in range(1, 41):
+        page_url = url if page == 1 else f"{url}?product-page={page}"
+
+        try:
+            response = requests.get(
+                page_url,
+                headers=HEADERS,
+                timeout=25,
+            )
+            response.raise_for_status()
+        except requests.RequestException as error:
+            print(f"Errore nel caricamento {page_url}: {error}")
+            break
+
+        soup = BeautifulSoup(response.text, "html.parser")
+        cards = soup.select(
+            "li.product, .product-small, .product-item, "
+            ".wc-block-grid__product"
+        )
+
+        if not cards:
+            if page == 1:
+                print(f"Nessun prodotto riconosciuto in {url}")
+            break
+
+        found_on_page = 0
+
+        for card in cards:
+            link = card.select_one(
+                "a.woocommerce-LoopProduct-link, "
+                "a.product-image-link, a[href]"
+            )
+            title_element = card.select_one(
+                ".woocommerce-loop-product__title, "
+                ".product-title, h2, h3"
+            )
+
+            if not link or not title_element:
+                continue
+
+            title = title_element.get_text(" ", strip=True)
+            product_url = urljoin(BASE_URL, link.get("href", ""))
+
+            if not title or not product_url.startswith("http"):
+                continue
+
+            if not is_tcg(title):
+                continue
+
+            price_element = card.select_one(
+                ".price, .woocommerce-Price-amount"
+            )
+            price = (
+                price_element.get_text(" ", strip=True)
+                if price_element
+                else "Prezzo da verificare"
+            )
+
+            products[product_url] = {
+                "title": title,
+                "url": product_url,
+                "price": price,
+            }
+            found_on_page += 1
+
+        print(f"Pagina {page}: {found_on_page} prodotti TCG")
+
+        if page > 1 and found_on_page == 0:
+            break
+
+        time.sleep(1)
+
+    return products
 
 
 def main():
-    html = fetch_page()
+    old_state = load_state()
+    old_products = set(old_state.get("products", []))
+    current_products = {}
 
-    parser = ProductParser()
-    parser.feed(html)
+    for category, url in SOURCES:
+        print(f"Controllo: {category}")
+        found = get_products(url)
 
-    products = {}
-    for product in parser.products:
-        products[product["url"]] = product["name"]
+        for product_url, product in found.items():
+            product["category"] = category
+            current_products[product_url] = product
 
-    if not products:
-        raise RuntimeError(
-            "Non ho trovato prodotti nella pagina. "
-            "La struttura HTML potrebbe essere diversa da quella prevista."
-        )
-
-    state = load_state()
-
-    # Al primo controllo, oppure al cambio di sito,
-    # registra i prodotti presenti senza inviare notifiche in massa.
-    if not isinstance(state, dict) or state.get("site") != SITE:
-        save_state(products.keys())
-        send_telegram(
-            "✅ Monitor CarteMagic avviato!\n"
-            f"Prodotti riconosciuti: {len(products)}.\n"
-            "Questa è la scansione iniziale: "
-            "ti avviserò dei nuovi prodotti rilevati in seguito."
-        )
+    if not current_products:
+        print("Nessun prodotto trovato. Non modifico lo stato.")
         return
 
-    previous = set(state.get("products", []))
-    current = set(products.keys())
-    new_products = current - previous
+    new_urls = set(current_products) - old_products
 
-    for product_url in sorted(new_products):
+    if not old_products:
+        save_state(current_products.keys())
         send_telegram(
-            "🆕 Nuovo prodotto su CarteMagic:\n"
-            f"{products[product_url]}\n"
-            f"{product_url}"
+            "Monitor CarteMagic avviato!\n"
+            f"Prodotti TCG riconosciuti: {len(current_products)}.\n"
+            "Questa è la scansione iniziale: ti avviserò "
+            "quando rileverò nuovi prodotti."
         )
+        print("Prima scansione completata.")
+        return
 
-    save_state(current)
+    for product_url in sorted(new_urls):
+        product = current_products[product_url]
+        message = (
+            f"🆕 NUOVO PRODOTTO TCG\n\n"
+            f"📦 {product['title']}\n"
+            f"🏷️ {product['category']}\n"
+            f"💶 {product['price']}\n\n"
+            f"🔗 {product['url']}"
+        )
+        send_telegram(message)
+        time.sleep(1)
 
-    print(
-        f"Controllo completato: {len(products)} prodotti, "
-        f"{len(new_products)} nuovi."
-    )
+    save_state(old_products | set(current_products.keys()))
+    print(f"Controllo completato. Nuovi prodotti: {len(new_urls)}.")
 
 
 if __name__ == "__main__":
