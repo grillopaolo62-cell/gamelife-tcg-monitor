@@ -11,11 +11,12 @@ permissions:
 
 concurrency:
   group: monitor-cartemagic
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   monitor:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
       - name: Scarica il progetto
